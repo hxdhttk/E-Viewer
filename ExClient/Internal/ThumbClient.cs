@@ -87,10 +87,11 @@ namespace ExClient.Internal {
         ) {
             try {
                 await _ProcessingLock.WaitAsync();
+                var thumbFolder = await ApplicationData.Current.LocalFolder.CreateFolderAsync("Thumbs", CreationCollisionOption.OpenIfExists);
                 StorageFile file = null;
 
                 var hashFileName = GetHash(source.AbsoluteUri + pageId) + _ImageExtension;
-                file = await ApplicationData.Current.LocalFolder.TryGetFileAsync(hashFileName);
+                file = await thumbFolder?.TryGetFileAsync(hashFileName);
                 if (file == null) {
                     using (
                         var image = Mat.FromStream(stream.AsStreamForRead(), ImreadModes.Unchanged)
@@ -104,7 +105,7 @@ namespace ExClient.Internal {
                             new OpenCvSharp.Rect(x, 0, thumbnailWidth, image.Height)
                         );
                         using var croppedImage = TrimTransparentBackground(originalThumb);
-                        file = await ApplicationData.Current.LocalFolder.CreateFileAsync(
+                        file = await thumbFolder.CreateFileAsync(
                             hashFileName,
                             CreationCollisionOption.ReplaceExisting
                         );
