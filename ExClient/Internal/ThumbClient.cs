@@ -60,10 +60,19 @@ namespace ExClient.Internal {
 
         private static async Task<bool> loadThumbAsync(Uri source, BitmapImage target, int pageId) {
             try {
+                var (_, _, file) = await GetThumbFilePathAsync(source, pageId);
+                if (file != null) {
+                    using (var thumbStream = await file.OpenAsync(FileAccessMode.Read)) {
+                        await target.SetSourceAsync(thumbStream);
+                    }
+                    return true;
+                }
+
                 if (!TryGetCache(source, out var buf)) {
                     buf = await _Client.GetBufferAsync(source);
                     await PushCache(source, buf);
                 }
+
                 using (var stream = buf.AsRandomAccessStream()) {
                     if (pageId == -1) {
                         await target.SetSourceAsync(stream);
@@ -87,12 +96,8 @@ namespace ExClient.Internal {
         ) {
             try {
                 await _ProcessingLock.WaitAsync();
-                var thumbFolder = await ApplicationData.Current.LocalFolder.CreateFolderAsync("Thumbs", CreationCollisionOption.OpenIfExists);
-                StorageFile file = null;
-
-                var hashFileName = GetHash(source.AbsoluteUri + pageId) + _ImageExtension;
-                file = await thumbFolder?.TryGetFileAsync(hashFileName);
-                if (file == null) {
+                var (thumbFolder, hashFileName, file) = await GetThumbFilePathAsync(source, pageId);
+                if (thumbFolder != null && file == null) {
                     using (
                         var image = Mat.FromStream(stream.AsStreamForRead(), ImreadModes.Unchanged)
                     ) {
@@ -113,6 +118,10 @@ namespace ExClient.Internal {
                     }
                 }
 
+                if (file == null) {
+                    return;
+                }
+
                 using (var thumbStream = await file.OpenAsync(FileAccessMode.Read)) {
                     await target.SetSourceAsync(thumbStream);
                 }
@@ -121,6 +130,12 @@ namespace ExClient.Internal {
             }
         }
 
+        private static async Task<(IStorageFolder thumbFolder, string hashFileName, IStorageFile file)> GetThumbFilePathAsync(Uri source, int pageId) {
+            var thumbFolder = await ApplicationData.Current.LocalFolder.CreateFolderAsync("Thumbs", CreationCollisionOption.OpenIfExists);
+            var hashFileName = GetHash(source.AbsoluteUri + pageId) + _ImageExtension;
+            var file = await thumbFolder?.TryGetFileAsync(hashFileName);
+            return (thumbFolder, hashFileName, file);
+        }
         public static Mat TrimTransparentBackground(Mat source, byte alphaThreshold = 5) {
             if (source == null || source.Empty()) {
                 throw new ArgumentNullException(nameof(source), "源图像不能为空。");
