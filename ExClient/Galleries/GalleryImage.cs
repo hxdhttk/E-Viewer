@@ -172,7 +172,7 @@ namespace ExClient.Galleries
                         await img.SetSourceAsync(stream);
                     }
                 }
-                else if (!await ThumbClient.FetchThumbAsync(uri, img))
+                else if (!await ThumbClient.FetchThumbAsync(uri, img, PageId))
                     return;
             }
             catch
