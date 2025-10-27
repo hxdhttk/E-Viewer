@@ -2,11 +2,10 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices.WindowsRuntime;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats.Png;
-using SixLabors.ImageSharp.Processing;
+using OpenCvSharp;
 using Windows.Foundation;
 using Windows.Storage;
 using Windows.Storage.Streams;
@@ -18,12 +17,17 @@ namespace ExClient.Internal {
         private static readonly HttpClient _Client = new();
 
         private static readonly SemaphoreSlim _CacheLock = new SemaphoreSlim(1, 1);
-        private static readonly PngEncoder _PngEncoder = new PngEncoder();
+
+        private static readonly string _ImageExtension = ".png";
         private static readonly int _MaxCacheSize = 800;
         private static readonly Queue<Uri> _KeyCache = new();
         private static readonly Dictionary<Uri, IBuffer> _Cache = new();
+        private static readonly SHA256 _SHA256 = SHA256.Create();
 
-        private static readonly SemaphoreSlim _ProcessingLock = new SemaphoreSlim(4, Math.Max(4, Environment.ProcessorCount));
+        private static readonly SemaphoreSlim _ProcessingLock = new SemaphoreSlim(
+            4,
+            Math.Max(4, Environment.ProcessorCount)
+        );
 
         public static Uri FormatThumbUri(string uri) {
             if (uri.IsNullOrWhiteSpace())
@@ -31,9 +35,20 @@ namespace ExClient.Internal {
             return new Uri(uri);
         }
 
+        private static string GetHash(string input) {
+            if (input.IsNullOrWhiteSpace())
+                return null;
+            var bytes = _SHA256.ComputeHash(System.Text.Encoding.UTF8.GetBytes(input));
+            return BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant();
+        }
+
         public static Uri FormatThumbUri(Uri uri) => FormatThumbUri(uri?.ToString());
 
-        public static IAsyncOperation<bool> FetchThumbAsync(Uri source, BitmapImage target, int pageId = -1) {
+        public static IAsyncOperation<bool> FetchThumbAsync(
+            Uri source,
+            BitmapImage target,
+            int pageId = -1
+        ) {
             if (source is null)
                 throw new ArgumentNullException(nameof(source));
             if (target is null)
@@ -53,7 +68,7 @@ namespace ExClient.Internal {
                     if (pageId == -1) {
                         await target.SetSourceAsync(stream);
                     } else {
-                        await CropThumbnailAsync(stream, target, pageId);
+                        await CropThumbnailAsync(source, stream, target, pageId);
                     }
                 }
             } catch (Exception) {
@@ -62,34 +77,86 @@ namespace ExClient.Internal {
             return true;
         }
 
-        private static async Task CropThumbnailAsync(IRandomAccessStream stream, BitmapImage target, int pageId, int maxThumbnailCount = 20, int thumbnailWidth = 200) {
+        private static async Task CropThumbnailAsync(
+            Uri source,
+            IRandomAccessStream stream,
+            BitmapImage target,
+            int pageId,
+            int maxThumbnailCount = 20,
+            int thumbnailWidth = 200
+        ) {
             try {
                 await _ProcessingLock.WaitAsync();
-                using (Image image = await Image.LoadAsync(stream.AsStreamForRead())) {
-                    int totalThumbnails = image.Width / thumbnailWidth;
-                    int index = (pageId - 1) % maxThumbnailCount;
-                    int x = index * thumbnailWidth;
+                StorageFile file = null;
 
-                    await CropImageSync(image, new Rectangle(x, 0, thumbnailWidth, image.Height));
+                var hashFileName = GetHash(source.AbsoluteUri + pageId) + _ImageExtension;
+                file = await ApplicationData.Current.LocalFolder.TryGetFileAsync(hashFileName);
+                if (file == null) {
+                    using (
+                        var image = Mat.FromStream(stream.AsStreamForRead(), ImreadModes.Unchanged)
+                    ) {
+                        int totalThumbnails = image.Width / thumbnailWidth;
+                        int index = (pageId - 1) % maxThumbnailCount;
+                        int x = index * thumbnailWidth;
 
-                    using (MemoryStream ms = new MemoryStream()) {
-                        await image.SaveAsync(ms, _PngEncoder);
-                        ms.Position = 0;
-
-                        await target.SetSourceAsync(ms.AsRandomAccessStream());
+                        using var originalThumb = new Mat(
+                            image,
+                            new OpenCvSharp.Rect(x, 0, thumbnailWidth, image.Height)
+                        );
+                        using var croppedImage = TrimTransparentBackground(originalThumb);
+                        file = await ApplicationData.Current.LocalFolder.CreateFileAsync(
+                            hashFileName,
+                            CreationCollisionOption.ReplaceExisting
+                        );
+                        croppedImage.SaveImage(file.Path);
                     }
+                }
+
+                using (var thumbStream = await file.OpenAsync(FileAccessMode.Read)) {
+                    await target.SetSourceAsync(thumbStream);
                 }
             } finally {
                 _ProcessingLock.Release();
             }
         }
 
-        private static async Task<Image> CropImageSync(Image image, Rectangle rect) {
-            await Task.Run(() => {
-                image.Mutate(ctx => ctx.Crop(rect));
-            });
+        public static Mat TrimTransparentBackground(Mat source, byte alphaThreshold = 5) {
+            if (source == null || source.Empty()) {
+                throw new ArgumentNullException(nameof(source), "源图像不能为空。");
+            }
 
-            return image;
+            if (source.Channels() != 4) {
+                Console.WriteLine("警告：图像没有Alpha通道，无法按透明度修剪。");
+                return source;
+            }
+
+            // 提取Alpha通道
+            Mat alphaChannel = new Mat();
+            Cv2.ExtractChannel(source, alphaChannel, 3);
+
+            // 创建二值掩码，标记非透明区域
+            Mat mask = new Mat();
+            Cv2.Threshold(alphaChannel, mask, alphaThreshold, 255, ThresholdTypes.Binary);
+
+            // 查找非零点（非透明区域）
+            Mat nonZeroPoints = new Mat();
+            Cv2.FindNonZero(mask, nonZeroPoints);
+
+            if (nonZeroPoints.Empty()) {
+                // 图像完全透明
+                return source;
+            }
+
+            // 直接从点集计算边界框
+            OpenCvSharp.Rect boundingRect = Cv2.BoundingRect(nonZeroPoints);
+
+            // 释放中间过程的Mat对象
+            alphaChannel.Dispose();
+            mask.Dispose();
+            nonZeroPoints.Dispose();
+
+            // 从原始图像中裁剪出目标区域
+            return new Mat(source, boundingRect);
         }
 
         private static async Task PushCache(Uri uri, IBuffer buffer) {
